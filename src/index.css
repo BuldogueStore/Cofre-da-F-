@@ -1,0 +1,41 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --color-faith-blue: #2C2C54;
+  --color-hope-green: #2E8B57;
+  --color-prosperity-gold: #D4AF37;
+  --color-purity-white: #FFFFFF;
+  --color-soft-gray: #F5F5F5;
+  --color-expense-red: #E74C3C;
+}
+
+@layer base {
+  body {
+    @apply bg-faith-blue text-white font-sans antialiased;
+  }
+}
+
+.glass-card {
+  @apply bg-white text-slate-900 shadow-[0_8px_0_0_rgba(0,0,0,0.05)] rounded-2xl border-2 border-slate-100;
+}
+
+.card-3d {
+  @apply transition-all duration-200 border-b-4 active:border-b-0 active:translate-y-1;
+}
+
+.btn-3d {
+  @apply transition-all duration-200 border-b-4 active:border-b-0 active:translate-y-1 shadow-lg;
+}
+
+.btn-primary {
+  @apply bg-hope-green text-white px-6 py-3 rounded-full font-bold transition-all hover:bg-hope-green/90 active:scale-95 shadow-lg;
+}
+
+.btn-secondary {
+  @apply bg-white border border-slate-200 text-slate-700 px-6 py-3 rounded-full font-bold transition-all hover:bg-slate-50 active:scale-95;
+}
+
+.tab-active {
+  @apply text-prosperity-gold border-b-2 border-prosperity-gold;
+}

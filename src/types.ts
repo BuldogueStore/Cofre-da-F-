@@ -45,6 +45,8 @@ export const CATEGORIES = [
   'Dízimos/Ofertas',
   'Saúde',
   'Educação',
+  'Salários',
+  'Dinheiro extra',
   'Outros'
 ];
 

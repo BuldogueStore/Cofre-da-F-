@@ -35,7 +35,7 @@ import {
   MoreHorizontal,
   LayoutGrid
 } from 'lucide-react';
-import { format, startOfMonth, endOfMonth, isWithinInterval, parseISO, eachMonthOfInterval, subMonths, isSameMonth } from 'date-fns';
+import { format, startOfMonth, endOfMonth, isWithinInterval, parseISO, eachMonthOfInterval, subMonths, isSameMonth, addMonths, isSameYear } from 'date-fns';
 import { ptBR } from 'date-fns/locale';
 import { PieChart as RePieChart, Pie, Cell, ResponsiveContainer, Tooltip, Legend } from 'recharts';
 import { GoogleGenAI } from "@google/genai";
@@ -63,6 +63,7 @@ export default function App() {
   const [category, setCategory] = useState(CATEGORIES[0]);
   const [description, setDescription] = useState('');
   const [date, setDate] = useState(format(new Date(), 'yyyy-MM-dd'));
+  const [installments, setInstallments] = useState(1);
 
   useEffect(() => {
     // Check current session
@@ -170,17 +171,27 @@ export default function App() {
     if (!user) return;
 
     try {
-      const { error } = await supabase.from('transactions').insert([
-        {
+      const baseValue = parseFloat(value);
+      const isExpense = type === 'expense';
+      const numOfInstallments = isExpense ? Math.max(1, installments) : 1;
+      const installmentValue = baseValue / numOfInstallments;
+      const baseDate = parseISO(date);
+
+      const inserts = [];
+      for (let i = 0; i < numOfInstallments; i++) {
+        const descSuffix = numOfInstallments > 1 ? ` (${i + 1}/${numOfInstallments})` : '';
+        inserts.push({
           user_id: user.id,
           type,
-          value: parseFloat(value),
+          value: Number(installmentValue.toFixed(2)),
           category,
-          description,
-          date: new Date(date).toISOString(),
+          description: description + descSuffix,
+          date: addMonths(baseDate, i).toISOString(),
           created_at: new Date().toISOString()
-        }
-      ]);
+        });
+      }
+
+      const { error } = await supabase.from('transactions').insert(inserts);
 
       if (error) throw error;
 
@@ -198,6 +209,7 @@ export default function App() {
     setCategory(CATEGORIES[0]);
     setDescription('');
     setDate(format(new Date(), 'yyyy-MM-dd'));
+    setInstallments(1);
   };
 
   const handleDeleteTransaction = async (id: string) => {
@@ -404,9 +416,12 @@ export default function App() {
       {/* Header */}
       <header className="bg-faith-blue text-white p-4 sm:p-6 rounded-b-[40px] shadow-lg border-b border-white/10">
         <div className="max-w-4xl mx-auto flex justify-between items-center mb-4 sm:mb-6">
-          <div>
-            <h1 className="text-sm sm:text-xl font-medium opacity-80">Olá, {profile?.name || 'Fiel'}</h1>
-            <p className="text-lg sm:text-2xl font-bold">Paz seja convosco!</p>
+          <div className="flex items-center gap-3">
+            <img src="https://i.ibb.co/ZR63b529/LOGO-GTA.png" alt="Fivecom Logo" className="w-12 h-12 object-contain bg-white rounded-full p-1 shadow-lg" />
+            <div>
+              <h1 className="text-sm sm:text-xl font-medium opacity-80">Olá, {profile?.name || 'Membro'}</h1>
+              <p className="text-lg sm:text-2xl font-bold">Paz seja convosco!</p>
+            </div>
           </div>
           <button 
             onClick={() => supabase.auth.signOut()}
@@ -486,13 +501,37 @@ export default function App() {
                     }`}
                   >
                     <Icon className="w-6 h-6" />
-                    <span className="text-[10px] font-bold uppercase truncate w-full text-center">
-                      {cat === 'Dízimos' ? 'Dízimos' : cat}
+                    <span className="text-[10px] font-bold uppercase truncate w-full flex-1 text-center items-center flex justify-center leading-tight">
+                      {cat === 'Dízimos/Ofertas' ? 'Dízimos' : cat === 'Dinheiro extra' ? 'Extra' : cat}
                     </span>
                   </button>
                 );
               })}
             </div>
+
+            {/* Resumo Fixas e Variáveis */}
+            {!selectedCategory && (
+              <div className="glass-card p-4 sm:p-6 card-3d border-slate-100 flex flex-col sm:flex-row items-center gap-4 sm:gap-6 justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="bg-faith-blue/10 p-3 rounded-2xl text-faith-blue">
+                    <PieChart className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <p className="text-xs text-slate-500 font-bold uppercase">Fixas (Total)</p>
+                    <p className="font-bold text-lg text-slate-900">R$ {totalFixedExpenses.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-3">
+                  <div className="bg-rose-100 p-3 rounded-2xl text-rose-600">
+                    <TrendingDown className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <p className="text-xs text-slate-500 font-bold uppercase">Variáveis (Mês)</p>
+                    <p className="font-bold text-lg text-slate-900">R$ {Math.max(0, monthExpense - totalFixedExpenses).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</p>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* Summary Insights */}
             {!selectedCategory && (
@@ -600,9 +639,13 @@ export default function App() {
             animate={{ opacity: 1 }}
             className="glass-card p-6 card-3d border-slate-100"
           >
-            <h3 className="font-bold text-xl mb-6">Histórico Completo</h3>
+            <h3 className="font-bold text-xl mb-6">Histórico (Ano Atual e Parcelas)</h3>
             <div className="space-y-4">
-              {transactions.map(t => (
+              {transactions.filter(t => {
+                const tDate = parseISO(t.date);
+                const now = new Date();
+                return isSameYear(tDate, now) || tDate > now;
+              }).map(t => (
                 <div key={t.id} className="flex justify-between items-center p-4 border-b border-slate-100 last:border-0 hover:bg-slate-50 rounded-xl transition-colors group">
                   <div className="flex items-center gap-4">
                     <div className={`p-3 rounded-2xl ${t.type === 'income' ? 'bg-emerald-100 text-emerald-600' : 'bg-rose-100 text-rose-600'}`}>
@@ -826,44 +869,52 @@ export default function App() {
               </div>
 
               {/* Add Fixed Expense Form */}
-              <div className="p-4 border-2 border-dashed border-slate-200 rounded-[32px] space-y-4">
+              <form 
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const form = e.currentTarget;
+                  const name = (form.elements.namedItem('name') as HTMLInputElement).value;
+                  const value = parseFloat((form.elements.namedItem('value') as HTMLInputElement).value);
+                  const category = (form.elements.namedItem('category') as HTMLSelectElement).value;
+                  if (name && value) {
+                    handleAddFixedExpense(name, value, category);
+                    form.reset();
+                  }
+                }}
+                className="p-4 border-2 border-dashed border-slate-200 rounded-[32px] space-y-4"
+              >
                 <p className="text-sm font-bold text-slate-500 uppercase text-center">Adicionar Nova Despesa Fixa</p>
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   <input
-                    id="fe-name"
+                    name="name"
                     type="text"
                     placeholder="Nome (ex: Aluguel)"
                     className="w-full px-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-sm outline-none"
+                    required
                   />
                   <input
-                    id="fe-value"
+                    name="value"
                     type="number"
+                    step="0.01"
                     placeholder="Valor"
                     className="w-full px-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-sm outline-none"
+                    required
                   />
                   <select
-                    id="fe-category"
+                    name="category"
                     className="w-full px-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-sm outline-none"
+                    required
                   >
                     {CATEGORIES.map(cat => <option key={cat} value={cat}>{cat}</option>)}
                   </select>
                 </div>
                 <button
-                  onClick={() => {
-                    const name = (document.getElementById('fe-name') as HTMLInputElement).value;
-                    const value = parseFloat((document.getElementById('fe-value') as HTMLInputElement).value);
-                    const category = (document.getElementById('fe-category') as HTMLSelectElement).value;
-                    if (name && value) {
-                      handleAddFixedExpense(name, value, category);
-                      (document.getElementById('fe-name') as HTMLInputElement).value = '';
-                      (document.getElementById('fe-value') as HTMLInputElement).value = '';
-                    }
-                  }}
+                  type="submit"
                   className="w-full bg-hope-green text-white py-3 rounded-2xl font-bold hover:bg-hope-green/90 transition-all"
                 >
                   Adicionar Despesa
                 </button>
-              </div>
+              </form>
             </div>
 
             {/* Budget Planning Section */}
@@ -1092,6 +1143,24 @@ export default function App() {
                       </div>
                     </div>
                   </div>
+
+                  {type === 'expense' && (
+                    <div className="space-y-1">
+                      <label className="text-xs font-bold text-slate-500 uppercase ml-2">Nº de Parcelas</label>
+                      <div className="relative">
+                        <Calendar className="absolute left-3 top-3.5 text-slate-400 w-5 h-5" />
+                        <input
+                          type="number"
+                          min="1"
+                          max="120"
+                          className="w-full pl-10 pr-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl text-slate-900 focus:ring-2 focus:ring-hope-green outline-none"
+                          value={installments}
+                          onChange={(e) => setInstallments(parseInt(e.target.value) || 1)}
+                        />
+                      </div>
+                      <p className="text-[10px] text-slate-500 ml-2 mt-1 px-1">O valor será dividido igualmente entre as parcelas.</p>
+                    </div>
+                  )}
 
                   <div className="space-y-1">
                     <label className="text-xs font-bold text-slate-500 uppercase ml-2">Descrição</label>

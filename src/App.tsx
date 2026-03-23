@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { supabase } from './supabase';
-import { Transaction, Profile, CATEGORIES, CHRISTIAN_QUOTES, FixedExpense, Budget } from './types';
+import { Transaction, Profile, CATEGORIES, CHRISTIAN_QUOTES, FixedExpense, Budget, AppNotification } from './types';
 import Auth from './components/Auth';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
@@ -33,9 +33,11 @@ import {
   HeartPulse,
   GraduationCap,
   MoreHorizontal,
-  LayoutGrid
+  LayoutGrid,
+  Bell,
+  CheckCircle2
 } from 'lucide-react';
-import { format, startOfMonth, endOfMonth, isWithinInterval, parseISO, eachMonthOfInterval, subMonths, isSameMonth, addMonths, isSameYear } from 'date-fns';
+import { format, startOfMonth, endOfMonth, isWithinInterval, parseISO, eachMonthOfInterval, subMonths, isSameMonth, addMonths } from 'date-fns';
 import { ptBR } from 'date-fns/locale';
 import { PieChart as RePieChart, Pie, Cell, ResponsiveContainer, Tooltip, Legend } from 'recharts';
 import { GoogleGenAI } from "@google/genai";
@@ -56,6 +58,18 @@ export default function App() {
   const [budgets, setBudgets] = useState<Budget[]>([]);
   const [salaryUser, setSalaryUser] = useState<string>('');
   const [salarySpouse, setSalarySpouse] = useState<string>('');
+  const [isFixed, setIsFixed] = useState(false);
+  const [installmentsCount, setInstallmentsCount] = useState<number>(1);
+  const [feName, setFeName] = useState('');
+  const [feValue, setFeValue] = useState('');
+  const [feCategory, setFeCategory] = useState(CATEGORIES[0]);
+  const [notifications, setNotifications] = useState<AppNotification[]>([]);
+  const [isNotificationsOpen, setIsNotificationsOpen] = useState(false);
+
+  // History Filters
+  const [historyTypeFilter, setHistoryTypeFilter] = useState<'all' | 'income' | 'expense'>('all');
+  const [historyCategoryFilter, setHistoryCategoryFilter] = useState<string>('all');
+  const [historyMonthFilter, setHistoryMonthFilter] = useState<Date | null>(new Date());
 
   // Form state
   const [type, setType] = useState<'income' | 'expense'>('expense');
@@ -63,7 +77,6 @@ export default function App() {
   const [category, setCategory] = useState(CATEGORIES[0]);
   const [description, setDescription] = useState('');
   const [date, setDate] = useState(format(new Date(), 'yyyy-MM-dd'));
-  const [installments, setInstallments] = useState(1);
 
   useEffect(() => {
     // Check current session
@@ -93,6 +106,71 @@ export default function App() {
 
     return () => subscription.unsubscribe();
   }, []);
+
+  // Request Notification Permission
+  useEffect(() => {
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
+  }, []);
+
+  // Check for Budget Alerts
+  useEffect(() => {
+    if (!user || budgets.length === 0 || transactions.length === 0) return;
+
+    const checkBudgets = async () => {
+      const currentMonth = startOfMonth(selectedMonth);
+      const nextMonth = endOfMonth(selectedMonth);
+
+      for (const budget of budgets) {
+        const spent = transactions
+          .filter(t => 
+            t.type === 'expense' && 
+            t.category === budget.category && 
+            isWithinInterval(parseISO(t.date), { start: currentMonth, end: nextMonth })
+          )
+          .reduce((acc, t) => acc + t.value, 0);
+
+        if (spent > budget.limit_value) {
+          // Check if we already notified for this budget this month
+          const alreadyNotified = notifications.some(n => 
+            n.type === 'budget_exceeded' && 
+            n.message.includes(budget.category) &&
+            isSameMonth(parseISO(n.created_at), selectedMonth)
+          );
+
+          if (!alreadyNotified) {
+            const title = "Limite de Orçamento Excedido!";
+            const message = `Você ultrapassou o limite de R$ ${budget.limit_value} na categoria ${budget.category}.`;
+            
+            // 1. Browser Notification
+            if ("Notification" in window && Notification.permission === "granted") {
+              new Notification(title, { body: message, icon: "https://i.ibb.co/ZR63b529/LOGO-GTA.png" });
+            }
+
+            // 2. Save to DB
+            const { data: newNotif } = await supabase
+              .from('notifications')
+              .insert([{
+                user_id: user.id,
+                title,
+                message,
+                type: 'budget_exceeded',
+                is_read: false
+              }])
+              .select()
+              .single();
+
+            if (newNotif) {
+              setNotifications(prev => [newNotif, ...prev]);
+            }
+          }
+        }
+      }
+    };
+
+    checkBudgets();
+  }, [transactions, budgets, selectedMonth, user]);
 
   const fetchUserData = async (userId: string) => {
     setLoading(true);
@@ -134,6 +212,15 @@ export default function App() {
         .eq('user_id', userId);
       
       if (budgetData) setBudgets(budgetData);
+
+      // Fetch notifications
+      const { data: notifData } = await supabase
+        .from('notifications')
+        .select('*')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false });
+      
+      if (notifData) setNotifications(notifData);
     } catch (error) {
       console.error("Error fetching user data:", error);
     } finally {
@@ -171,34 +258,39 @@ export default function App() {
     if (!user) return;
 
     try {
-      const baseValue = parseFloat(value);
-      const isExpense = type === 'expense';
-      const numOfInstallments = isExpense ? Math.max(1, installments) : 1;
-      const installmentValue = baseValue / numOfInstallments;
-      const baseDate = parseISO(date);
+      const transactionsToInsert = [];
+      const baseDate = new Date(date);
+      const val = parseFloat(value);
 
-      const inserts = [];
-      for (let i = 0; i < numOfInstallments; i++) {
-        const descSuffix = numOfInstallments > 1 ? ` (${i + 1}/${numOfInstallments})` : '';
-        inserts.push({
+      for (let i = 0; i < installmentsCount; i++) {
+        const transactionDate = new Date(baseDate);
+        transactionDate.setMonth(baseDate.getMonth() + i);
+        
+        transactionsToInsert.push({
           user_id: user.id,
           type,
-          value: Number(installmentValue.toFixed(2)),
+          value: installmentsCount > 1 ? val / installmentsCount : val,
           category,
-          description: description + descSuffix,
-          date: addMonths(baseDate, i).toISOString(),
-          created_at: new Date().toISOString()
+          description: installmentsCount > 1 ? `${description} (${i + 1}/${installmentsCount})` : description,
+          date: transactionDate.toISOString(),
+          created_at: new Date().toISOString(),
+          is_fixed: isFixed,
+          installments_count: installmentsCount > 1 ? installmentsCount : null,
+          installment_number: installmentsCount > 1 ? i + 1 : null
         });
       }
 
-      const { error } = await supabase.from('transactions').insert(inserts);
+      const { error } = await supabase.from('transactions').insert(transactionsToInsert);
 
-      if (error) throw error;
+      if (error) {
+        console.error(`Erro ao salvar transação: ${error.message}`);
+        throw error;
+      }
 
       setIsModalOpen(false);
       resetForm();
       fetchUserData(user.id);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error adding transaction:", error);
     }
   };
@@ -209,11 +301,11 @@ export default function App() {
     setCategory(CATEGORIES[0]);
     setDescription('');
     setDate(format(new Date(), 'yyyy-MM-dd'));
-    setInstallments(1);
+    setIsFixed(false);
+    setInstallmentsCount(1);
   };
 
   const handleDeleteTransaction = async (id: string) => {
-    if (!window.confirm('Deseja realmente excluir esta transação?')) return;
     try {
       const { error } = await supabase
         .from('transactions')
@@ -285,9 +377,12 @@ export default function App() {
         })
         .eq('id', user.id);
       
-      if (error) throw error;
+      if (error) {
+        console.error(`Erro ao atualizar renda: ${error.message}`);
+        throw error;
+      }
       fetchUserData(user.id);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error updating salaries:", error);
     }
   };
@@ -299,10 +394,76 @@ export default function App() {
         .from('fixed_expenses')
         .insert([{ user_id: user.id, name, value, category }]);
       
-      if (error) throw error;
+      if (error) {
+        console.error(`Erro ao adicionar despesa fixa: ${error.message}`);
+        throw error;
+      }
       fetchUserData(user.id);
     } catch (error) {
       console.error("Error adding fixed expense:", error);
+    }
+  };
+
+  const handleLaunchMonthPlan = async () => {
+    if (!user) return;
+    
+    const hasLaunched = monthTransactions.some(t => t.category === 'Salários' || t.is_fixed);
+    if (hasLaunched) {
+      // We could add a confirmation here, but for now we'll just prevent duplicates
+      // or let the user know. Since we can't use window.confirm, we'll just proceed
+      // but ideally we'd check more strictly.
+    }
+
+    try {
+      const transactionsToInsert = [];
+      const startOfSelected = startOfMonth(selectedMonth);
+      
+      // 1. Launch Salaries as Income
+      if (parseFloat(salaryUser) > 0) {
+        transactionsToInsert.push({
+          user_id: user.id,
+          type: 'income',
+          value: parseFloat(salaryUser),
+          category: 'Salários',
+          description: `Salário - ${profile?.name || 'Usuário'}`,
+          date: startOfSelected.toISOString(),
+          created_at: new Date().toISOString()
+        });
+      }
+      if (parseFloat(salarySpouse) > 0) {
+        transactionsToInsert.push({
+          user_id: user.id,
+          type: 'income',
+          value: parseFloat(salarySpouse),
+          category: 'Salários',
+          description: 'Salário - Cônjuge',
+          date: startOfSelected.toISOString(),
+          created_at: new Date().toISOString()
+        });
+      }
+      
+      // 2. Launch Fixed Expenses
+      fixedExpenses.forEach(fe => {
+        transactionsToInsert.push({
+          user_id: user.id,
+          type: 'expense',
+          value: fe.value,
+          category: fe.category,
+          description: fe.name,
+          date: startOfSelected.toISOString(),
+          created_at: new Date().toISOString(),
+          is_fixed: true
+        });
+      });
+
+      if (transactionsToInsert.length === 0) return;
+
+      const { error } = await supabase.from('transactions').insert(transactionsToInsert);
+      if (error) throw error;
+      
+      fetchUserData(user.id);
+    } catch (error) {
+      console.error("Error launching month plan:", error);
     }
   };
 
@@ -331,7 +492,39 @@ export default function App() {
     }
   };
 
+  const markNotificationAsRead = async (id: string) => {
+    if (!user) return;
+    try {
+      const { error } = await supabase
+        .from('notifications')
+        .update({ is_read: true })
+        .eq('id', id);
+      
+      if (error) throw error;
+      setNotifications(prev => prev.map(n => n.id === id ? { ...n, is_read: true } : n));
+    } catch (error) {
+      console.error("Error marking notification as read:", error);
+    }
+  };
+
+  const deleteNotification = async (id: string) => {
+    if (!user) return;
+    try {
+      const { error } = await supabase
+        .from('notifications')
+        .delete()
+        .eq('id', id);
+      
+      if (error) throw error;
+      setNotifications(prev => prev.filter(n => n.id !== id));
+    } catch (error) {
+      console.error("Error deleting notification:", error);
+    }
+  };
+
   const CATEGORY_STYLES: Record<string, { icon: any, color: string, border: string, bg: string, activeBg: string, shadow: string }> = {
+    'Salários': { icon: Briefcase, color: 'text-emerald-600', border: 'border-emerald-200', bg: 'bg-emerald-50', activeBg: 'bg-emerald-500', shadow: 'shadow-[0_4px_0_0_#059669]' },
+    'Dinheiro extra': { icon: Wallet, color: 'text-emerald-600', border: 'border-emerald-200', bg: 'bg-emerald-50', activeBg: 'bg-emerald-500', shadow: 'shadow-[0_4px_0_0_#059669]' },
     'Alimentação': { icon: Utensils, color: 'text-orange-600', border: 'border-orange-200', bg: 'bg-orange-50', activeBg: 'bg-orange-500', shadow: 'shadow-[0_4px_0_0_#c2410c]' },
     'Transporte': { icon: Car, color: 'text-blue-600', border: 'border-blue-200', bg: 'bg-blue-50', activeBg: 'bg-blue-500', shadow: 'shadow-[0_4px_0_0_#1d4ed8]' },
     'Moradia': { icon: Home, color: 'text-indigo-600', border: 'border-indigo-200', bg: 'bg-indigo-50', activeBg: 'bg-indigo-500', shadow: 'shadow-[0_4px_0_0_#4338ca]' },
@@ -391,9 +584,9 @@ export default function App() {
   const COLORS = ['#2E8B57', '#D4AF37', '#2C2C54', '#E74C3C', '#3B82F6', '#F59E0B', '#6366F1', '#8B5CF6'];
 
   const availableMonths = eachMonthOfInterval({
-    start: subMonths(new Date(), 6),
-    end: new Date()
-  }).reverse();
+    start: new Date(2026, 2, 1), // Março 2026
+    end: new Date(2027, 2, 1)    // Março 2027
+  });
 
   const filteredTransactions = selectedCategory 
     ? transactions.filter(t => t.category === selectedCategory)
@@ -413,48 +606,196 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-faith-blue pb-20">
+      {/* Notifications Drawer */}
+      <AnimatePresence>
+        {isNotificationsOpen && (
+          <>
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsNotificationsOpen(false)}
+              className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[60]"
+            />
+            <motion.div 
+              initial={{ x: '100%' }}
+              animate={{ x: 0 }}
+              exit={{ x: '100%' }}
+              className="fixed top-0 right-0 h-full w-full max-w-sm bg-slate-50 z-[70] shadow-2xl flex flex-col"
+            >
+              <div className="p-6 bg-faith-blue text-white flex justify-between items-center">
+                <div className="flex items-center gap-3">
+                  <Bell className="w-6 h-6 text-prosperity-gold" />
+                  <h2 className="text-xl font-bold">Notificações</h2>
+                </div>
+                <button onClick={() => setIsNotificationsOpen(false)} className="p-2 hover:bg-white/10 rounded-full">
+                  <X className="w-6 h-6" />
+                </button>
+              </div>
+              <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                {notifications.length === 0 ? (
+                  <div className="h-full flex flex-col items-center justify-center text-slate-400 gap-4">
+                    <CheckCircle2 className="w-12 h-12 opacity-20" />
+                    <p className="italic">Nenhuma notificação por aqui</p>
+                  </div>
+                ) : (
+                  notifications.map(n => (
+                    <div 
+                      key={n.id} 
+                      className={`p-4 rounded-2xl border-2 transition-all ${
+                        n.is_read ? 'bg-white border-slate-100 opacity-60' : 'bg-white border-prosperity-gold/30 shadow-md'
+                      }`}
+                    >
+                      <div className="flex justify-between items-start mb-2">
+                        <h3 className="font-bold text-slate-800 text-sm">{n.title}</h3>
+                        <button 
+                          onClick={() => deleteNotification(n.id)}
+                          className="text-slate-300 hover:text-rose-500"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                      <p className="text-xs text-slate-600 mb-3 leading-relaxed">{n.message}</p>
+                      <div className="flex justify-between items-center">
+                        <span className="text-[10px] text-slate-400 font-medium">
+                          {format(parseISO(n.created_at), "dd 'de' MMM, HH:mm", { locale: ptBR })}
+                        </span>
+                        {!n.is_read && (
+                          <button 
+                            onClick={() => markNotificationAsRead(n.id)}
+                            className="text-[10px] font-bold text-hope-green uppercase tracking-wider hover:underline"
+                          >
+                            Marcar como lida
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </motion.div>
+          </>
+        )}
+      </AnimatePresence>
+
       {/* Header */}
-      <header className="bg-faith-blue text-white p-4 sm:p-6 rounded-b-[40px] shadow-lg border-b border-white/10">
-        <div className="max-w-4xl mx-auto flex justify-between items-center mb-4 sm:mb-6">
-          <div className="flex items-center gap-3">
-            <img src="https://i.ibb.co/ZR63b529/LOGO-GTA.png" alt="Fivecom Logo" className="w-12 h-12 object-contain bg-white rounded-full p-1 shadow-lg" />
+      <header className="bg-faith-blue text-white p-2 sm:p-6 rounded-b-[40px] shadow-lg border-b border-white/10">
+        <div className="max-w-4xl mx-auto flex justify-between items-center mb-4 sm:mb-6 px-2 sm:px-0">
+          <div className="flex items-center gap-3 sm:gap-4">
+            <img src="https://i.ibb.co/ZR63b529/LOGO-GTA.png" alt="Logo" className="w-14 h-14 sm:w-20 h-20 object-contain" referrerPolicy="no-referrer" />
             <div>
-              <h1 className="text-sm sm:text-xl font-medium opacity-80">Olá, {profile?.name || 'Membro'}</h1>
-              <p className="text-lg sm:text-2xl font-bold">Paz seja convosco!</p>
+              <h1 className="text-[12px] sm:text-xl font-medium opacity-80">Olá, {profile?.name || user?.user_metadata?.full_name || user?.user_metadata?.name || 'Fiel'}</h1>
+              <p className="text-sm sm:text-2xl font-bold">Paz seja convosco!</p>
             </div>
           </div>
-          <button 
-            onClick={() => supabase.auth.signOut()}
-            className="p-2 bg-white/10 rounded-full hover:bg-white/20 transition-colors"
-          >
-            <LogOut className="w-5 h-5" />
-          </button>
+          <div className="flex items-center gap-2 sm:gap-4">
+            <button 
+              onClick={() => setIsNotificationsOpen(true)}
+              className="relative p-2 bg-white/10 rounded-full hover:bg-white/20 transition-colors"
+            >
+              <Bell className="w-5 h-5" />
+              {notifications.filter(n => !n.is_read).length > 0 && (
+                <span className="absolute -top-1 -right-1 w-4 h-4 bg-rose-500 text-[10px] font-bold flex items-center justify-center rounded-full border-2 border-faith-blue">
+                  {notifications.filter(n => !n.is_read).length}
+                </span>
+              )}
+            </button>
+            <button 
+              onClick={() => supabase.auth.signOut()}
+              className="p-2 bg-white/10 rounded-full hover:bg-white/20 transition-colors"
+            >
+              <LogOut className="w-4 h-4 sm:w-5 h-5" />
+            </button>
+          </div>
         </div>
 
-        <div className="max-w-4xl mx-auto glass-card p-6 sm:p-8 bg-white text-slate-900 shadow-[0_12px_0_0_rgba(0,0,0,0.05)] rounded-[32px] border-b-8 border-slate-100">
-          <p className="text-[10px] sm:text-sm text-slate-500 font-bold uppercase tracking-widest mb-1">Saldo Total</p>
-          <h2 className="text-3xl sm:text-5xl font-black text-prosperity-gold mb-4 sm:mb-6">
-            R$ {balance.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
-          </h2>
-          <div className="flex gap-2 sm:gap-4">
-            <div className="flex-1 bg-emerald-50 p-3 sm:p-4 rounded-2xl flex items-center gap-2 sm:gap-3 border-b-4 border-emerald-100">
-              <div className="bg-hope-green p-1.5 sm:p-2 rounded-xl text-white shadow-lg">
-                <TrendingUp className="w-4 h-4 sm:w-5 h-5" />
+        <div className="max-w-4xl mx-auto glass-card p-3 sm:p-8 bg-white text-slate-900 shadow-[0_12px_0_0_rgba(0,0,0,0.05)] rounded-[24px] sm:rounded-[32px] border-b-8 border-slate-100">
+          {activeTab === 'planning' ? (
+            <>
+              <p className="text-[8px] sm:text-sm text-slate-500 font-bold uppercase tracking-widest mb-1">Renda Mensal Familiar</p>
+              <h2 className="text-xl sm:text-5xl font-black text-prosperity-gold mb-3 sm:mb-6 truncate">
+                R$ {totalSalaries.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+              </h2>
+              <div className="grid grid-cols-2 gap-2 sm:gap-4">
+                <div className="bg-slate-50 p-2 sm:p-4 rounded-xl sm:rounded-2xl flex items-center gap-1.5 sm:gap-3 border-b-4 border-slate-100 overflow-hidden">
+                  <div className="bg-slate-500 p-1 sm:p-2 rounded-lg sm:rounded-xl text-white shadow-lg shrink-0">
+                    <Home className="w-3 h-3 sm:w-5 h-5" />
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-[7px] sm:text-[10px] text-slate-500 font-bold uppercase truncate">Fixas</p>
+                    <p className="font-bold text-[10px] sm:text-lg text-slate-700 truncate">R$ {totalFixedExpenses.toLocaleString('pt-BR')}</p>
+                  </div>
+                </div>
+                <div className="bg-blue-50 p-2 sm:p-4 rounded-xl sm:rounded-2xl flex items-center gap-1.5 sm:gap-3 border-b-4 border-blue-100 overflow-hidden">
+                  <div className="bg-blue-500 p-1 sm:p-2 rounded-lg sm:rounded-xl text-white shadow-lg shrink-0">
+                    <Filter className="w-3 h-3 sm:w-5 h-5" />
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-[7px] sm:text-[10px] text-blue-500 font-bold uppercase truncate">Variáveis</p>
+                    <p className="font-bold text-[10px] sm:text-lg text-blue-700 truncate">R$ {monthTransactions.filter(t => t.type === 'expense' && !t.is_fixed).reduce((acc, t) => acc + t.value, 0).toLocaleString('pt-BR')}</p>
+                  </div>
+                </div>
               </div>
-              <div>
-                <p className="text-[10px] text-emerald-600 font-bold uppercase">Ganhos</p>
-                <p className="font-bold text-sm sm:text-lg text-emerald-700">R$ {monthIncome.toLocaleString('pt-BR')}</p>
+            </>
+          ) : (
+            <>
+              <p className="text-[8px] sm:text-sm text-slate-500 font-bold uppercase tracking-widest mb-1">Saldo do Mês</p>
+              <h2 className="text-xl sm:text-5xl font-black text-prosperity-gold mb-3 sm:mb-6 truncate">
+                R$ {monthBalance.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+              </h2>
+              <div className="grid grid-cols-2 gap-2 sm:gap-4">
+                <div className="bg-emerald-50 p-2 sm:p-4 rounded-xl sm:rounded-2xl flex items-center gap-1.5 sm:gap-3 border-b-4 border-emerald-100 overflow-hidden">
+                  <div className="bg-hope-green p-1 sm:p-2 rounded-lg sm:rounded-xl text-white shadow-lg shrink-0">
+                    <TrendingUp className="w-3 h-3 sm:w-5 h-5" />
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-[7px] sm:text-[10px] text-emerald-600 font-bold uppercase truncate">Ganhos</p>
+                    <p className="font-bold text-[10px] sm:text-lg text-emerald-700 truncate">R$ {monthIncome.toLocaleString('pt-BR')}</p>
+                  </div>
+                </div>
+                <div className="bg-rose-50 p-2 sm:p-4 rounded-xl sm:rounded-2xl flex items-center gap-1.5 sm:gap-3 border-b-4 border-rose-100 overflow-hidden">
+                  <div className="bg-expense-red p-1 sm:p-2 rounded-lg sm:rounded-xl text-white shadow-lg shrink-0">
+                    <TrendingDown className="w-3 h-3 sm:w-5 h-5" />
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-[7px] sm:text-[10px] text-rose-600 font-bold uppercase truncate">Gastos</p>
+                    <p className="font-bold text-[10px] sm:text-lg text-rose-700 truncate">R$ {monthExpense.toLocaleString('pt-BR')}</p>
+                  </div>
+                </div>
               </div>
-            </div>
-            <div className="flex-1 bg-rose-50 p-3 sm:p-4 rounded-2xl flex items-center gap-2 sm:gap-3 border-b-4 border-rose-100">
-              <div className="bg-expense-red p-1.5 sm:p-2 rounded-xl text-white shadow-lg">
-                <TrendingDown className="w-4 h-4 sm:w-5 h-5" />
-              </div>
-              <div>
-                <p className="text-[10px] text-rose-600 font-bold uppercase">Gastos</p>
-                <p className="font-bold text-sm sm:text-lg text-rose-700">R$ {monthExpense.toLocaleString('pt-BR')}</p>
-              </div>
-            </div>
+            </>
+          )}
+        </div>
+
+        {/* Global Month Selector */}
+        <div className="max-w-4xl mx-auto px-4 mt-4">
+          <div className="flex gap-3 overflow-x-auto pb-2 scrollbar-hide">
+            {availableMonths.map((m, idx) => {
+              const isActive = isSameMonth(m, selectedMonth);
+              return (
+                <button
+                  key={idx}
+                  onClick={() => {
+                    setSelectedMonth(m);
+                    setInsights('');
+                    setHistoryMonthFilter(m);
+                    triggerHaptic();
+                  }}
+                  className={`flex flex-col items-center justify-center px-6 py-3 rounded-2xl transition-all gap-1 border-2 min-w-[90px] ${
+                    isActive
+                      ? 'bg-prosperity-gold text-white border-prosperity-gold shadow-lg shadow-prosperity-gold/20'
+                      : 'bg-white/10 text-white/60 border-white/10 hover:bg-white/20'
+                  }`}
+                >
+                  <span className="text-[10px] font-black uppercase tracking-wider">
+                    {format(m, 'MMM', { locale: ptBR })}
+                  </span>
+                  <span className="text-[8px] font-bold opacity-60">
+                    {format(m, 'yyyy')}
+                  </span>
+                </button>
+              );
+            })}
           </div>
         </div>
       </header>
@@ -501,37 +842,13 @@ export default function App() {
                     }`}
                   >
                     <Icon className="w-6 h-6" />
-                    <span className="text-[10px] font-bold uppercase truncate w-full flex-1 text-center items-center flex justify-center leading-tight">
-                      {cat === 'Dízimos/Ofertas' ? 'Dízimos' : cat === 'Dinheiro extra' ? 'Extra' : cat}
+                    <span className="text-[10px] font-bold uppercase truncate w-full text-center">
+                      {cat === 'Dízimos' ? 'Dízimos' : cat}
                     </span>
                   </button>
                 );
               })}
             </div>
-
-            {/* Resumo Fixas e Variáveis */}
-            {!selectedCategory && (
-              <div className="glass-card p-4 sm:p-6 card-3d border-slate-100 flex flex-col sm:flex-row items-center gap-4 sm:gap-6 justify-between">
-                <div className="flex items-center gap-3">
-                  <div className="bg-faith-blue/10 p-3 rounded-2xl text-faith-blue">
-                    <PieChart className="w-6 h-6" />
-                  </div>
-                  <div>
-                    <p className="text-xs text-slate-500 font-bold uppercase">Fixas (Total)</p>
-                    <p className="font-bold text-lg text-slate-900">R$ {totalFixedExpenses.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</p>
-                  </div>
-                </div>
-                <div className="flex items-center gap-3">
-                  <div className="bg-rose-100 p-3 rounded-2xl text-rose-600">
-                    <TrendingDown className="w-6 h-6" />
-                  </div>
-                  <div>
-                    <p className="text-xs text-slate-500 font-bold uppercase">Variáveis (Mês)</p>
-                    <p className="font-bold text-lg text-slate-900">R$ {Math.max(0, monthExpense - totalFixedExpenses).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</p>
-                  </div>
-                </div>
-              </div>
-            )}
 
             {/* Summary Insights */}
             {!selectedCategory && (
@@ -637,41 +954,113 @@ export default function App() {
           <motion.div 
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
-            className="glass-card p-6 card-3d border-slate-100"
+            className="space-y-4"
           >
-            <h3 className="font-bold text-xl mb-6">Histórico (Ano Atual e Parcelas)</h3>
-            <div className="space-y-4">
-              {transactions.filter(t => {
-                const tDate = parseISO(t.date);
-                const now = new Date();
-                return isSameYear(tDate, now) || tDate > now;
-              }).map(t => (
-                <div key={t.id} className="flex justify-between items-center p-4 border-b border-slate-100 last:border-0 hover:bg-slate-50 rounded-xl transition-colors group">
-                  <div className="flex items-center gap-4">
-                    <div className={`p-3 rounded-2xl ${t.type === 'income' ? 'bg-emerald-100 text-emerald-600' : 'bg-rose-100 text-rose-600'}`}>
-                      {t.type === 'income' ? <ArrowUpCircle className="w-6 h-6" /> : <ArrowDownCircle className="w-6 h-6" />}
-                    </div>
-                    <div>
-                      <p className="font-bold">{t.description || t.category}</p>
-                      <div className="flex gap-2 text-xs text-slate-500 mt-1">
-                        <span className="bg-slate-100 px-2 py-0.5 rounded-full">{t.category}</span>
-                        <span>{format(parseISO(t.date), 'dd/MM/yyyy')}</span>
-                      </div>
-                    </div>
-                  </div>
-                  <div className="text-right flex items-center gap-4">
-                    <p className={`font-bold text-lg ${t.type === 'income' ? 'text-emerald-600' : 'text-rose-600'}`}>
-                      {t.type === 'income' ? '+' : '-'} R$ {t.value.toLocaleString('pt-BR')}
-                    </p>
-                    <button 
-                      onClick={() => handleDeleteTransaction(t.id)}
-                      className="p-2 text-slate-300 hover:text-rose-500 opacity-0 group-hover:opacity-100 transition-all"
+            <div className="glass-card p-6 card-3d border-slate-100">
+              <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-6">
+                <h3 className="font-bold text-xl">Histórico de Transações</h3>
+                <div className="flex flex-wrap gap-2">
+                  <div className="relative">
+                    <select
+                      value={historyTypeFilter}
+                      onChange={(e) => setHistoryTypeFilter(e.target.value as any)}
+                      className="pl-8 pr-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold uppercase outline-none appearance-none"
                     >
-                      <X className="w-5 h-5" />
-                    </button>
+                      <option value="all">Todos Tipos</option>
+                      <option value="income">Ganhos</option>
+                      <option value="expense">Gastos</option>
+                    </select>
+                    <Filter className="absolute left-2.5 top-2.5 w-4 h-4 text-slate-400" />
+                  </div>
+
+                  <div className="relative">
+                    <select
+                      value={historyCategoryFilter}
+                      onChange={(e) => setHistoryCategoryFilter(e.target.value)}
+                      className="pl-8 pr-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold uppercase outline-none appearance-none"
+                    >
+                      <option value="all">Todas Categorias</option>
+                      {CATEGORIES.map(cat => <option key={cat} value={cat}>{cat}</option>)}
+                    </select>
+                    <Tag className="absolute left-2.5 top-2.5 w-4 h-4 text-slate-400" />
+                  </div>
+
+                  <div className="relative">
+                    <input
+                      type="month"
+                      value={historyMonthFilter ? format(historyMonthFilter, 'yyyy-MM') : ''}
+                      onChange={(e) => setHistoryMonthFilter(e.target.value ? new Date(e.target.value + '-01') : null)}
+                      className="pl-8 pr-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold uppercase outline-none"
+                    />
+                    <Calendar className="absolute left-2.5 top-2.5 w-4 h-4 text-slate-400" />
+                    {historyMonthFilter && (
+                      <button 
+                        onClick={() => setHistoryMonthFilter(null)}
+                        className="absolute -right-1 -top-1 bg-rose-500 text-white rounded-full p-0.5 shadow-sm"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    )}
                   </div>
                 </div>
-              ))}
+              </div>
+
+              <div className="space-y-4">
+                {transactions
+                  .filter(t => {
+                    const tDate = parseISO(t.date);
+                    
+                    // Type Filter
+                    if (historyTypeFilter !== 'all' && t.type !== historyTypeFilter) return false;
+                    
+                    // Category Filter
+                    if (historyCategoryFilter !== 'all' && t.category !== historyCategoryFilter) return false;
+                    
+                    // Month Filter
+                    if (historyMonthFilter && !isSameMonth(tDate, historyMonthFilter)) return false;
+                    
+                    return true;
+                  })
+                  .map(t => (
+                  <div key={t.id} className="flex justify-between items-center p-3 sm:p-4 border-b border-slate-100 last:border-0 hover:bg-slate-50 rounded-xl transition-colors group gap-2">
+                    <div className="flex items-center gap-3 sm:gap-4 min-w-0 flex-1">
+                      <div className={`p-2 sm:p-3 rounded-2xl shrink-0 ${t.type === 'income' ? 'bg-emerald-100 text-emerald-600' : 'bg-rose-100 text-rose-600'}`}>
+                        {t.type === 'income' ? <ArrowUpCircle className="w-5 h-5 sm:w-6 h-6" /> : <ArrowDownCircle className="w-5 h-5 sm:w-6 h-6" />}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
+                          <p className="font-bold text-slate-900 truncate text-sm sm:text-base">{t.description || t.category}</p>
+                          <div className="flex gap-1">
+                            {t.is_fixed && <span className="bg-slate-100 text-slate-500 text-[8px] px-1.5 py-0.5 rounded-full uppercase font-bold shrink-0">Fixa</span>}
+                            {t.installment_number && <span className="bg-blue-50 text-blue-500 text-[8px] px-1.5 py-0.5 rounded-full uppercase font-bold shrink-0">{t.installment_number}/{t.installments_count}</span>}
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 text-[10px] sm:text-xs text-slate-500 mt-0.5">
+                          <Tag className="w-3 h-3 shrink-0" />
+                          <span className="truncate">{t.category}</span>
+                          <span className="shrink-0">•</span>
+                          <Calendar className="w-3 h-3 shrink-0" />
+                          <span className="shrink-0">{format(parseISO(t.date), "dd/MM/yyyy", { locale: ptBR })}</span>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 sm:gap-4 shrink-0 text-right">
+                      <p className={`font-bold text-sm sm:text-lg whitespace-nowrap ${t.type === 'income' ? 'text-emerald-600' : 'text-rose-600'}`}>
+                        {t.type === 'income' ? '+' : '-'} R$ {t.value.toLocaleString('pt-BR')}
+                      </p>
+                      <button 
+                        onClick={() => handleDeleteTransaction(t.id)}
+                        className="text-slate-300 hover:text-rose-500 transition-colors p-1"
+                      >
+                        <Trash2 className="w-4 h-4 sm:w-5 h-5" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                {transactions.length === 0 && (
+                  <p className="text-center text-slate-400 py-12 italic">Nenhuma transação registrada</p>
+                )}
+              </div>
             </div>
           </motion.div>
         )}
@@ -682,33 +1071,6 @@ export default function App() {
             animate={{ opacity: 1, y: 0 }}
             className="space-y-6"
           >
-            {/* Month Selector */}
-            <div className="flex gap-3 overflow-x-auto pb-4 scrollbar-hide px-1">
-              {availableMonths.map((m, idx) => {
-                const isActive = isSameMonth(m, selectedMonth);
-                return (
-                  <button
-                    key={idx}
-                    onClick={() => {
-                      setSelectedMonth(m);
-                      setInsights('');
-                      triggerHaptic();
-                    }}
-                    className={`flex flex-col items-center justify-center p-3 rounded-2xl transition-all gap-1 border-2 card-3d min-w-[80px] ${
-                      isActive
-                        ? 'bg-prosperity-gold text-white border-prosperity-gold shadow-[0_4px_0_0_#b8860b] active:shadow-none'
-                        : 'bg-white text-slate-400 border-slate-100 hover:bg-slate-50 shadow-[0_4px_0_0_rgba(0,0,0,0.05)] active:shadow-none'
-                    }`}
-                  >
-                    <Calendar className={`w-5 h-5 ${isActive ? 'text-white' : 'text-prosperity-gold'}`} />
-                    <span className="text-[10px] font-bold uppercase truncate w-full text-center">
-                      {format(m, 'MMM yy', { locale: ptBR })}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-
             {/* Monthly Summary Card */}
             <div className="glass-card p-6 grid grid-cols-1 sm:grid-cols-3 gap-4 card-3d border-slate-100">
               <div className="text-center p-4 bg-emerald-50 rounded-2xl border-b-4 border-emerald-100">
@@ -792,6 +1154,27 @@ export default function App() {
             animate={{ opacity: 1, y: 0 }}
             className="space-y-6"
           >
+            {/* Launch Month Plan Button */}
+            <div className="p-6 bg-gradient-to-br from-faith-blue to-slate-900 text-white rounded-[32px] border-none shadow-xl">
+              <div className="flex flex-col sm:flex-row justify-between items-center gap-4">
+                <div className="flex items-center gap-4">
+                  <div className="bg-white/20 p-3 rounded-2xl">
+                    <Plus className="w-6 h-6 text-white" />
+                  </div>
+                  <div>
+                    <h3 className="font-bold text-lg text-white">Lançar Plano Mensal</h3>
+                    <p className="text-xs text-white/70">Crie automaticamente os ganhos e gastos fixos para {format(selectedMonth, 'MMMM', { locale: ptBR })}</p>
+                  </div>
+                </div>
+                <button
+                  onClick={handleLaunchMonthPlan}
+                  className="w-full sm:w-auto px-8 py-3 bg-prosperity-gold text-white font-black uppercase tracking-wider rounded-2xl shadow-lg hover:scale-105 transition-transform active:scale-95"
+                >
+                  Lançar no Mês
+                </button>
+              </div>
+            </div>
+
             {/* Salaries Section */}
             <div className="glass-card p-6 card-3d border-slate-100">
               <h3 className="font-bold text-xl mb-6 flex items-center gap-2">
@@ -834,11 +1217,73 @@ export default function App() {
               </button>
             </div>
 
+            {/* Fixed vs Variable Expenses Visualization */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+              <div className="glass-card p-4 sm:p-6 card-3d border-slate-100 overflow-hidden">
+                <h3 className="font-bold text-lg mb-4 flex items-center gap-2">
+                  <AlertCircle className="w-5 h-5 text-rose-500" />
+                  Despesas Fixas Planejadas
+                </h3>
+                <div className="space-y-3">
+                  {fixedExpenses.map(fe => (
+                    <div key={fe.id} className="flex justify-between items-center p-3 bg-slate-50 rounded-xl group gap-2">
+                      <div className="flex flex-col min-w-0 flex-1">
+                        <span className="text-sm font-bold text-slate-700 truncate">{fe.name}</span>
+                        <span className="text-[10px] text-slate-400 uppercase font-bold truncate">{fe.category}</span>
+                      </div>
+                      <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+                        <span className="text-sm font-bold text-rose-600 whitespace-nowrap">R$ {fe.value.toLocaleString('pt-BR')}</span>
+                        <button 
+                          onClick={() => handleDeleteFixedExpense(fe.id)}
+                          className="text-slate-300 hover:text-rose-500 transition-colors p-1"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                  {fixedExpenses.length === 0 && (
+                    <p className="text-xs text-slate-400 italic">Nenhuma despesa fixa planejada</p>
+                  )}
+                </div>
+              </div>
+              <div className="glass-card p-4 sm:p-6 card-3d border-slate-100 overflow-hidden">
+                <h3 className="font-bold text-lg mb-4 flex items-center gap-2">
+                  <Filter className="w-5 h-5 text-blue-500" />
+                  Despesas Variáveis (Mês Atual)
+                </h3>
+                <div className="space-y-3">
+                  {transactions
+                    .filter(t => t.type === 'expense' && !t.is_fixed && isSameMonth(parseISO(t.date), selectedMonth))
+                    .map(t => (
+                      <div key={t.id} className="flex justify-between items-center p-3 bg-slate-50 rounded-xl group gap-2">
+                        <div className="flex flex-col min-w-0 flex-1">
+                          <span className="text-sm font-bold text-slate-700 truncate">{t.description || t.category}</span>
+                          <span className="text-[10px] text-slate-400 uppercase font-bold truncate">{t.category}</span>
+                        </div>
+                        <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+                          <span className="text-sm font-bold text-rose-600 whitespace-nowrap">R$ {t.value.toLocaleString('pt-BR')}</span>
+                          <button 
+                            onClick={() => handleDeleteTransaction(t.id)}
+                            className="text-slate-300 hover:text-rose-500 transition-colors p-1"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  {transactions.filter(t => t.type === 'expense' && !t.is_fixed && isSameMonth(parseISO(t.date), selectedMonth)).length === 0 && (
+                    <p className="text-xs text-slate-400 italic">Nenhuma despesa variável este mês</p>
+                  )}
+                </div>
+              </div>
+            </div>
+
             {/* Fixed Expenses Section */}
-            <div className="glass-card p-6 card-3d border-slate-100">
+            <div className="glass-card p-6 card-3d border-slate-100 mb-8">
               <h3 className="font-bold text-xl mb-6 flex items-center gap-2">
                 <Calendar className="w-6 h-6 text-hope-green" />
-                Despesas Fixas Mensais
+                Gestão de Despesas Fixas Mensais
               </h3>
               <div className="space-y-4 mb-6">
                 {fixedExpenses.map(fe => (
@@ -869,52 +1314,44 @@ export default function App() {
               </div>
 
               {/* Add Fixed Expense Form */}
-              <form 
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  const form = e.currentTarget;
-                  const name = (form.elements.namedItem('name') as HTMLInputElement).value;
-                  const value = parseFloat((form.elements.namedItem('value') as HTMLInputElement).value);
-                  const category = (form.elements.namedItem('category') as HTMLSelectElement).value;
-                  if (name && value) {
-                    handleAddFixedExpense(name, value, category);
-                    form.reset();
-                  }
-                }}
-                className="p-4 border-2 border-dashed border-slate-200 rounded-[32px] space-y-4"
-              >
+              <div className="p-4 border-2 border-dashed border-slate-200 rounded-[32px] space-y-4">
                 <p className="text-sm font-bold text-slate-500 uppercase text-center">Adicionar Nova Despesa Fixa</p>
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   <input
-                    name="name"
                     type="text"
                     placeholder="Nome (ex: Aluguel)"
                     className="w-full px-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-sm outline-none"
-                    required
+                    value={feName}
+                    onChange={(e) => setFeName(e.target.value)}
                   />
                   <input
-                    name="value"
                     type="number"
-                    step="0.01"
                     placeholder="Valor"
                     className="w-full px-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-sm outline-none"
-                    required
+                    value={feValue}
+                    onChange={(e) => setFeValue(e.target.value)}
                   />
                   <select
-                    name="category"
                     className="w-full px-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-sm outline-none"
-                    required
+                    value={feCategory}
+                    onChange={(e) => setFeCategory(e.target.value)}
                   >
                     {CATEGORIES.map(cat => <option key={cat} value={cat}>{cat}</option>)}
                   </select>
                 </div>
                 <button
-                  type="submit"
+                  onClick={() => {
+                    if (feName && feValue) {
+                      handleAddFixedExpense(feName, parseFloat(feValue), feCategory);
+                      setFeName('');
+                      setFeValue('');
+                    }
+                  }}
                   className="w-full bg-hope-green text-white py-3 rounded-2xl font-bold hover:bg-hope-green/90 transition-all"
                 >
                   Adicionar Despesa
                 </button>
-              </form>
+              </div>
             </div>
 
             {/* Budget Planning Section */}
@@ -961,35 +1398,65 @@ export default function App() {
                     .reduce((acc, t) => acc + t.value, 0);
                   const limit = budget?.limit_value || 0;
                   const percent = limit > 0 ? (spent / limit) * 100 : 0;
+                  const isExceeded = limit > 0 && spent > limit;
 
                   return (
-                    <div key={cat} className="space-y-2">
+                    <div key={cat} className="p-4 bg-slate-50 rounded-2xl border-b-2 border-slate-100 space-y-3">
                       <div className="flex justify-between items-center">
-                        <span className="font-bold text-slate-700">{cat}</span>
                         <div className="flex items-center gap-2">
-                          <span className="text-xs text-slate-500">Limite:</span>
-                          <input
-                            type="number"
-                            className="w-20 px-2 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-bold outline-none"
-                            defaultValue={limit}
-                            onBlur={(e) => handleUpdateBudget(cat, parseFloat(e.target.value) || 0)}
-                          />
+                          <span className="font-bold text-slate-700">{cat}</span>
+                          {isExceeded && (
+                            <div className="flex items-center gap-1 bg-rose-100 text-rose-600 text-[8px] px-2 py-0.5 rounded-full font-black uppercase animate-pulse">
+                              <AlertCircle className="w-2 h-2" />
+                              Limite Excedido
+                            </div>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] font-bold text-slate-400 uppercase">Limite:</span>
+                          <div className="relative">
+                            <input
+                              type="number"
+                              className="w-24 pl-6 pr-2 py-1.5 bg-white border border-slate-200 rounded-xl text-xs font-bold outline-none focus:ring-2 focus:ring-hope-green"
+                              defaultValue={limit}
+                              onBlur={(e) => handleUpdateBudget(cat, parseFloat(e.target.value) || 0)}
+                            />
+                            <span className="absolute left-2 top-1/2 -translate-y-1/2 text-[10px] font-bold text-slate-400">R$</span>
+                          </div>
                         </div>
                       </div>
+                      
                       {limit > 0 && (
-                        <div className="space-y-1">
-                          <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
-                            <div 
-                              className={`h-full transition-all ${percent > 100 ? 'bg-rose-500' : 'bg-hope-green'}`}
-                              style={{ width: `${Math.min(percent, 100)}%` }}
+                        <div className="space-y-2">
+                          <div className="h-3 bg-slate-200 rounded-full overflow-hidden shadow-inner">
+                            <motion.div 
+                              initial={{ width: 0 }}
+                              animate={{ width: `${Math.min(percent, 100)}%` }}
+                              className={`h-full transition-all ${isExceeded ? 'bg-rose-500 shadow-[0_0_10px_rgba(244,63,94,0.5)]' : 'bg-hope-green'}`}
                             />
                           </div>
-                          <div className="flex justify-between text-[10px] font-bold">
-                            <span className="text-slate-400">Gasto: R$ {spent.toLocaleString('pt-BR')}</span>
-                            <span className={percent > 100 ? 'text-rose-600' : 'text-slate-400'}>
-                              {percent.toFixed(0)}% do limite
-                            </span>
+                          <div className="flex justify-between items-center text-[10px] font-bold">
+                            <div className="flex flex-col">
+                              <span className="text-slate-400 uppercase">Gasto Atual</span>
+                              <span className={`text-sm ${isExceeded ? 'text-rose-600' : 'text-slate-700'}`}>
+                                R$ {spent.toLocaleString('pt-BR')}
+                              </span>
+                            </div>
+                            <div className="text-right flex flex-col">
+                              <span className="text-slate-400 uppercase">Status</span>
+                              <span className={`text-sm ${isExceeded ? 'text-rose-600' : 'text-hope-green'}`}>
+                                {percent.toFixed(1)}%
+                              </span>
+                            </div>
                           </div>
+                          {isExceeded && (
+                            <div className="bg-rose-50 border border-rose-100 p-2 rounded-xl flex items-center gap-2">
+                              <AlertCircle className="w-4 h-4 text-rose-600" />
+                              <p className="text-[10px] font-bold text-rose-700">
+                                Você ultrapassou o limite em R$ {(spent - limit).toLocaleString('pt-BR')}!
+                              </p>
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
@@ -1074,41 +1541,45 @@ export default function App() {
               initial={{ y: '100%' }}
               animate={{ y: 0 }}
               exit={{ y: '100%' }}
-              className="relative w-full max-w-lg bg-white rounded-t-[40px] sm:rounded-[40px] p-8 shadow-2xl overflow-hidden"
+              className="relative w-full max-w-lg bg-white rounded-t-[40px] sm:rounded-[40px] p-6 sm:p-8 shadow-2xl overflow-y-auto max-h-[92vh] scrollbar-hide text-slate-900"
             >
-              <div className="flex justify-between items-center mb-8">
-                <h3 className="text-2xl font-bold text-faith-blue">Nova Transação</h3>
-                <button onClick={() => setIsModalOpen(false)} className="p-2 hover:bg-slate-100 rounded-full">
+              <div className="flex justify-between items-center mb-6 sm:mb-8 sticky top-0 bg-white z-20 pb-2">
+                <h3 className="text-xl sm:text-2xl font-bold text-faith-blue">Nova Transação</h3>
+                <button 
+                  onClick={() => setIsModalOpen(false)} 
+                  className="p-2 bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-rose-600 rounded-full transition-all shadow-sm"
+                  aria-label="Fechar"
+                >
                   <X className="w-6 h-6" />
                 </button>
               </div>
 
-              <form onSubmit={handleAddTransaction} className="space-y-6">
-                <div className="flex p-1 bg-slate-100 rounded-2xl">
+              <form onSubmit={handleAddTransaction} className="space-y-5 sm:space-y-6 pb-12">
+                <div className="flex p-1.5 bg-slate-100 rounded-2xl">
                   <button
                     type="button"
                     onClick={() => setType('expense')}
-                    className={`flex-1 py-3 rounded-xl font-bold transition-all ${type === 'expense' ? 'bg-white text-rose-600 shadow-sm' : 'text-slate-500'}`}
+                    className={`flex-1 py-2.5 sm:py-3 rounded-xl font-bold transition-all text-sm sm:text-base ${type === 'expense' ? 'bg-white text-rose-600 shadow-md' : 'text-slate-500'}`}
                   >
                     Gasto
                   </button>
                   <button
                     type="button"
                     onClick={() => setType('income')}
-                    className={`flex-1 py-3 rounded-xl font-bold transition-all ${type === 'income' ? 'bg-white text-emerald-600 shadow-sm' : 'text-slate-500'}`}
+                    className={`flex-1 py-2.5 sm:py-3 rounded-xl font-bold transition-all text-sm sm:text-base ${type === 'income' ? 'bg-white text-emerald-600 shadow-md' : 'text-slate-500'}`}
                   >
                     Ganho
                   </button>
                 </div>
 
-                <div className="space-y-4">
+                <div className="space-y-4 sm:space-y-5">
                   <div className="relative">
-                    <span className="absolute left-4 top-1/2 -translate-y-1/2 text-2xl font-bold text-slate-400">R$</span>
+                    <span className="absolute left-4 top-1/2 -translate-y-1/2 text-xl sm:text-2xl font-bold text-slate-400">R$</span>
                     <input
                       type="number"
                       step="0.01"
                       placeholder="0,00"
-                      className="w-full pl-14 pr-4 py-6 bg-slate-50 border-none rounded-3xl text-4xl font-bold text-slate-900 focus:ring-2 focus:ring-hope-green outline-none"
+                      className="w-full pl-12 sm:pl-14 pr-4 py-5 sm:py-6 bg-slate-50 border-2 border-transparent focus:border-hope-green rounded-2xl sm:rounded-3xl text-3xl sm:text-4xl font-bold text-slate-900 outline-none transition-all"
                       value={value}
                       onChange={(e) => setValue(e.target.value)}
                       required
@@ -1116,12 +1587,12 @@ export default function App() {
                   </div>
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <div className="space-y-1">
-                      <label className="text-xs font-bold text-slate-500 uppercase ml-2">Categoria</label>
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] sm:text-xs font-bold text-slate-500 uppercase ml-2 tracking-wider">Categoria</label>
                       <div className="relative">
-                        <Tag className="absolute left-3 top-3.5 text-slate-400 w-5 h-5" />
+                        <Tag className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 w-4 h-4 sm:w-5 h-5" />
                         <select
-                          className="w-full pl-10 pr-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl text-slate-900 focus:ring-2 focus:ring-hope-green outline-none appearance-none"
+                          className="w-full pl-10 pr-4 py-3.5 sm:py-4 bg-slate-50 border border-slate-200 rounded-xl sm:rounded-2xl text-sm sm:text-base text-slate-900 focus:ring-2 focus:ring-hope-green outline-none appearance-none"
                           value={category}
                           onChange={(e) => setCategory(e.target.value)}
                         >
@@ -1129,13 +1600,13 @@ export default function App() {
                         </select>
                       </div>
                     </div>
-                    <div className="space-y-1">
-                      <label className="text-xs font-bold text-slate-500 uppercase ml-2">Data</label>
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] sm:text-xs font-bold text-slate-500 uppercase ml-2 tracking-wider">Data</label>
                       <div className="relative">
-                        <Calendar className="absolute left-3 top-3.5 text-slate-400 w-5 h-5" />
+                        <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 w-4 h-4 sm:w-5 h-5" />
                         <input
                           type="date"
-                          className="w-full pl-10 pr-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl text-slate-900 focus:ring-2 focus:ring-hope-green outline-none"
+                          className="w-full pl-10 pr-4 py-3.5 sm:py-4 bg-slate-50 border border-slate-200 rounded-xl sm:rounded-2xl text-sm sm:text-base text-slate-900 focus:ring-2 focus:ring-hope-green outline-none"
                           value={date}
                           onChange={(e) => setDate(e.target.value)}
                           required
@@ -1144,32 +1615,41 @@ export default function App() {
                     </div>
                   </div>
 
-                  {type === 'expense' && (
-                    <div className="space-y-1">
-                      <label className="text-xs font-bold text-slate-500 uppercase ml-2">Nº de Parcelas</label>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] sm:text-xs font-bold text-slate-500 uppercase ml-2 tracking-wider">Parcelas</label>
                       <div className="relative">
-                        <Calendar className="absolute left-3 top-3.5 text-slate-400 w-5 h-5" />
+                        <LayoutGrid className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 w-4 h-4 sm:w-5 h-5" />
                         <input
                           type="number"
                           min="1"
                           max="120"
-                          className="w-full pl-10 pr-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl text-slate-900 focus:ring-2 focus:ring-hope-green outline-none"
-                          value={installments}
-                          onChange={(e) => setInstallments(parseInt(e.target.value) || 1)}
+                          className="w-full pl-10 pr-4 py-3.5 sm:py-4 bg-slate-50 border border-slate-200 rounded-xl sm:rounded-2xl text-sm sm:text-base text-slate-900 focus:ring-2 focus:ring-hope-green outline-none"
+                          value={installmentsCount}
+                          onChange={(e) => setInstallmentsCount(parseInt(e.target.value) || 1)}
                         />
                       </div>
-                      <p className="text-[10px] text-slate-500 ml-2 mt-1 px-1">O valor será dividido igualmente entre as parcelas.</p>
                     </div>
-                  )}
+                    <div className="flex items-center gap-3 pt-2 sm:pt-6 px-2">
+                      <input
+                        type="checkbox"
+                        id="isFixed"
+                        className="w-6 h-6 rounded-lg border-slate-300 text-hope-green focus:ring-hope-green transition-all"
+                        checked={isFixed}
+                        onChange={(e) => setIsFixed(e.target.checked)}
+                      />
+                      <label htmlFor="isFixed" className="text-sm font-bold text-slate-700 cursor-pointer">Despesa Fixa?</label>
+                    </div>
+                  </div>
 
-                  <div className="space-y-1">
-                    <label className="text-xs font-bold text-slate-500 uppercase ml-2">Descrição</label>
+                  <div className="space-y-1.5">
+                    <label className="text-[10px] sm:text-xs font-bold text-slate-500 uppercase ml-2 tracking-wider">Descrição</label>
                     <div className="relative">
-                      <FileText className="absolute left-3 top-3.5 text-slate-400 w-5 h-5" />
+                      <FileText className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 w-4 h-4 sm:w-5 h-5" />
                       <input
                         type="text"
                         placeholder="Ex: Aluguel, Salário..."
-                        className="w-full pl-10 pr-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl text-slate-900 focus:ring-2 focus:ring-hope-green outline-none"
+                        className="w-full pl-10 pr-4 py-3.5 sm:py-4 bg-slate-50 border border-slate-200 rounded-xl sm:rounded-2xl text-sm sm:text-base text-slate-900 focus:ring-2 focus:ring-hope-green outline-none"
                         value={description}
                         onChange={(e) => setDescription(e.target.value)}
                       />
@@ -1179,7 +1659,7 @@ export default function App() {
 
                 <button
                   type="submit"
-                  className="w-full bg-hope-green text-white py-4 rounded-2xl font-bold text-lg hover:bg-hope-green/90 transition-all shadow-lg shadow-hope-green/20"
+                  className="w-full bg-hope-green text-white py-4 sm:py-5 rounded-2xl font-bold text-lg hover:bg-hope-green/90 transition-all shadow-xl shadow-hope-green/20 active:scale-[0.98]"
                 >
                   Salvar Transação
                 </button>

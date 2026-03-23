@@ -9,6 +9,9 @@ export interface Transaction {
   description: string;
   date: string; // ISO string
   created_at: string; // ISO string
+  is_fixed?: boolean;
+  installments_count?: number;
+  installment_number?: number;
 }
 
 export interface Profile {
@@ -37,7 +40,19 @@ export interface Budget {
   created_at: string;
 }
 
+export interface AppNotification {
+  id: string;
+  user_id: string;
+  title: string;
+  message: string;
+  type: 'budget_exceeded' | 'system';
+  is_read: boolean;
+  created_at: string;
+}
+
 export const CATEGORIES = [
+  'Salários',
+  'Dinheiro extra',
   'Alimentação',
   'Transporte',
   'Moradia',
@@ -45,8 +60,6 @@ export const CATEGORIES = [
   'Dízimos/Ofertas',
   'Saúde',
   'Educação',
-  'Salários',
-  'Dinheiro extra',
   'Outros'
 ];
 
